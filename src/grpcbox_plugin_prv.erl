@@ -68,6 +68,10 @@ do(State) ->
                 end,
          TemplateName = to_template_name(Type),
          ServiceModules = proplists:get_value(service_modules, GrpcConfig, []),
+
+         IncludeDirs = [filename:join(BaseDir, D) || D <- proplists:get_all_values(i, GpbOpts)],
+         Graph = init_dag(AppInfo, IncludeDirs, ProtosDirs1, GpbOpts ++ [{i, ProtoDir} || ProtoDir <- ProtosDirs1]),
+
          [[begin
                GpbModule = compile_pb(Filename, GrpcOutDir, BaseDir, GpbOpts),
                gen_service_behaviour(TemplateName, ServiceModules, GpbModule, GrpcOutDir, Options, GrpcConfig, State)
@@ -178,3 +182,191 @@ list_snake_case(NameString) ->
     Snaked1 = string:replace(Snaked, ".", "_", all),
     Snaked2 = string:replace(Snaked1, "__", "_", all),
     string:to_lower(unicode:characters_to_list(Snaked2)).
+
+
+
+
+
+
+
+
+serialize(Graph) ->
+    SerializedGraph = lists:map(fun(Proto) ->
+                {Proto, Props} = digraph:vertex(Graph, Proto),
+                {Proto, Props, digraph:out_neighbours(Graph, Proto)}
+        end, digraph:vertices(Graph)),
+    digraph:delete(Graph),
+    SerializedGraph.
+
+deserialize(SerializedGraph, Graph) ->
+    lists:foreach(fun({Proto, Props, _Deps}) ->
+                digraph:add_vertex(Graph, Proto, Props)
+        end, SerializedGraph),
+    lists:foreach(fun({Proto, _Props, Deps}) ->
+                lists:foreach(fun(Dep) ->
+                            digraph:add_edge(Graph, Proto, Dep)
+                    end, Deps)
+        end, SerializedGraph),
+    Graph.
+
+dag_file(AppInfo) ->
+    EbinDir = rebar_app_info:ebin_dir(AppInfo),
+    CacheDir = rebar_dir:local_cache_dir(EbinDir),
+    filename:join([CacheDir, "grpcbox_plugin", "dependency.dag"]).
+
+restore_dag(AppInfo, Graph) ->
+    case file:read_file(dag_file(AppInfo)) of
+        {ok, Data} ->
+            deserialize(binary_to_term(Data), Graph);
+        {error, _} ->
+            Graph
+    end.
+
+init_dag(AppInfo, InclDirs, ProtoDirs, GpbOpts) ->
+    rebar_api:debug("dag include dirs: ~p~n", [InclDirs]),
+    rebar_api:debug("dag proto dirs: ~p~n", [ProtoDirs]),
+    rebar_api:debug("dag file: ~ts~n", [dag_file(AppInfo)]),
+    InitGraph = digraph:new([acyclic]),
+    Graph = try restore_dag(AppInfo, InitGraph)
+    catch
+        _:_ ->
+            rebar_api:warn("Failed to restore ~ts file. Discarding it.~n", [dag_file(AppInfo)]),
+            digraph:delete(InitGraph),
+            file:delete(dag_file(AppInfo)),
+            % Ensure empty graph
+            digraph:new([acyclic])
+    end,
+    scan_protos(InclDirs, ProtoDirs, Graph),
+    detect_compile_protos(Graph, GpbOpts),
+    Graph.
+    
+%do(InclDirs, ProtoDirs, Graph, GpbOpts) ->
+%    scan_protos(InclDirs, ProtoDirs, Graph),
+%    compile_protos(Graph, GpbOpts),
+%    lists:foreach(fun(Proto) ->
+%                {Proto, Props} = digraph:vertex(Graph, Proto),
+%                io:format("~p (~p) ->~n - ", [Proto, Props]),
+%                Deps = digraph:out_neighbours(Graph, Proto),
+%                lists:foreach(fun(Dep) ->
+%                            io:format("~p, ", [Dep])
+%                    end, Deps),
+%                io:format("~n", []),
+%                digraph:add_vertex(Graph, Proto, do_compile(Proto, Props))
+%        end, digraph:vertices(Graph)),
+%    Graph.
+
+scan_protos(InclDirs, ProtoDirs, Graph) ->
+    Includes = scan_dirs(InclDirs, include, Graph, sets:new()),
+    scan_dirs(ProtoDirs, proto, Graph, Includes),
+    Graph.
+
+scan_dirs(Dirs, Type, Graph, AllExistingProtos) ->
+    lists:foldl(fun(Dir, AllExistingProtosAcc) ->
+                scan_dir(Dir, Type, Graph, AllExistingProtosAcc)
+        end, AllExistingProtos, Dirs).
+
+scan_dir(Dir, Type, Graph, AllExistingProtos) ->
+    lists:foldl(fun(File, AllExistingProtosAcc) ->
+                Proto = filename:basename(File),
+                case sets:is_element(Proto, AllExistingProtosAcc) of
+                    true ->
+                        throw({dep_error, {duplicate_filename, Proto}});
+                    false ->
+                        ok
+                end,
+                case digraph:vertex(Graph, Proto) of
+                    false ->
+                        digraph:add_vertex(Graph, Proto,
+                            [Type, compile, {modified, filelib:last_modified(File)}, {file, File}]);
+                    _ ->
+                        ok
+                end,
+                sets:add_element(Proto, AllExistingProtosAcc)
+        end, AllExistingProtos, filelib:wildcard(filename:join(Dir, "*.proto"))).
+    
+detect_compile_protos(Graph, GpbOpts) ->
+    update_graph(Graph, GpbOpts),
+    spread_compile_from_deps(Graph).
+    
+update_graph(Graph, GpbOpts) ->
+    lists:foreach(fun(Proto) ->
+                {Proto, Props} = digraph:vertex(Graph, Proto),
+                File = proplists:get_value(file, Props),
+                Compile = proplists:get_value(compile, Props, false),
+                OldModified = proplists:get_value(modified, Props),
+                NewModified = filelib:last_modified(File),
+                if
+                    NewModified =:= 0 ->
+                        mark_all_compile(digraph:in_neighbours(Graph, Proto), Graph),
+                        digraph:del_vertex(Graph, Proto);
+                    Compile orelse NewModified /= OldModified ->
+                        mark_compile(Proto, Graph),
+                        update_proto_deps(Proto, Graph, GpbOpts);
+                    true ->
+                        ok
+                end
+        end, digraph:vertices(Graph)).
+
+
+update_proto_deps(Proto, Graph, GpbOpts) ->
+    Defs = case gpb_compile:file(Proto, [to_proto_defs, return | GpbOpts]) of
+        {ok, OkDefs, _Warnings} ->
+            OkDefs;
+        {error, Error, _Warnings} ->
+            throw({dep_error, Error})
+    end,
+    Deps = lists:usort(gpb_parse:fetch_imports(Defs)),
+    digraph:del_edges(Graph, digraph:out_edges(Graph, Proto)),
+    lists:foreach(fun(Dep) ->
+                case digraph:vertex(Graph, Dep) of
+                    false ->
+                        throw({dep_error, {dependency_not_found, Proto, Dep}});
+                    _ ->
+                        ok
+                end,
+                digraph:add_edge(Graph, Proto, Dep)
+        end, Deps).
+
+mark_all_compile(Protos, Graph) ->
+    lists:foreach(fun(Proto) -> mark_compile(Proto, Graph) end, Protos).
+
+mark_compile(Proto, Graph) ->
+    {Proto, Props} = digraph:vertex(Graph, Proto),
+    case proplists:get_value(compile, Props, false) of
+        false ->
+            digraph:add_vertex(Graph, Proto, [compile | Props]),
+            true;
+        true ->
+            % Already set to compile
+            false
+    end.
+    
+spread_compile_from_deps(Graph) ->
+    lists:foreach(fun(Proto) ->
+                {Proto, Props} = digraph:vertex(Graph, Proto),
+                Compile = proplists:get_value(compile, Props, false),
+                case Compile of
+                    true ->
+                        mark_compile_from_deps(Proto, Graph);
+                    false ->
+                        ok
+                end
+        end, digraph:vertices(Graph)).
+
+mark_compile_from_deps(Proto, Graph) ->
+    ReverseDeps = digraph:in_neighbours(Graph, Proto),
+    lists:foreach(fun(ReverseDep) ->
+                case mark_compile(ReverseDep, Graph) of
+                    true ->
+                        mark_compile_from_deps(ReverseDep, Graph);
+                    false ->
+                        ok
+                end
+        end, ReverseDeps).
+                
+do_compile(Proto, Props) ->
+    File = proplists:get_value(file, Props),
+    NewModified = filelib:last_modified(File),
+    NewProps = lists:keyreplace(modified, 1, lists:delete(compile, Props), {modified, NewModified}),
+    % COMPILE
+    NewProps.
