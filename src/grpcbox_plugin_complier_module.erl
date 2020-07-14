@@ -246,11 +246,10 @@ client_template() ->
 
 -module({{module_name}}_client).
 
--include_lib(\"grpcbox/include/grpcbox.hrl\").
+-compile(export_all).
+-compile(nowarn_export_all).
 
-{{#methods}}
--export([{{method}}/1, {{method}}/2, {{method}}/3]).
-{{/methods}}
+-include_lib(\"grpcbox/include/grpcbox.hrl\").
 
 -define(is_ctx(Ctx), is_tuple(Ctx) andalso element(1, Ctx) =:= ctx).
 
